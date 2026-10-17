@@ -1,0 +1,34 @@
+{
+    "schema": "1.0",
+    "type": "whmcs-gateways",
+    "name": "ovajj",
+    "license": "Proprietary",
+    "category": "payments",
+    "description": {
+        "name": "Ovajj",
+        "tagline": "Accept invoice payments through Ovajj checkout.",
+        "long": "Ovajj Payment Gateway lets clients pay WHMCS invoices on the Ovajj hosted checkout page. Every payment is confirmed by a signed webhook and an independent server-to-server verification before the invoice is marked as paid. Supports sandbox and live environments and refunds.",
+        "features": [
+            "Hosted checkout redirect (no card data touches your server)",
+            "Signed API requests and verified webhooks",
+            "Independent payment verification before an invoice is paid",
+            "Duplicate-payment protection and amount/currency checks",
+            "Sandbox and live environments",
+            "Refunds from the WHMCS admin"
+        ]
+    },
+    "authors": {
+        "name": "Ovajj",
+        "homepage": "https://ovajj.com/"
+    },
+    "logo": {
+    "filename": "https://ovajj.com/storage/images/2026/10/11/20261011_143344_logo_euTO.png"
+    },
+    "Contact Us": {
+        "homepage": "https://ovajj.com/contact",
+    },
+    "support": {
+        "homepage": "https://ovajj.com",
+        "docs_url": "https://ovajj.com/api-docs"
+    }
+}
