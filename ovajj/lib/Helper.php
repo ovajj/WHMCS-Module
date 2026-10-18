@@ -323,4 +323,248 @@ class Helper
 
         return $result;
     }
+
+    /* ---------------------------------------------------------------- *
+     * Currency conversion (optional): wallet currency, live/fixed rate
+     * ---------------------------------------------------------------- */
+
+    const SESSIONS_TABLE = 'mod_ovajj_sessions';
+    const RATES_TABLE    = 'mod_ovajj_rates';
+    const RATE_API       = 'https://open.er-api.com/v6/latest/';
+    const RATE_TTL       = 3600;    // fresh cache: 1 hour
+    const RATE_STALE_MAX = 172800;  // last known rate usable for 48 h if the provider is unreachable
+
+    private static $tablesReady = false;
+
+    /** Creates the module's own tables on first use (no WHMCS core tables are touched). */
+    public static function ensureTables()
+    {
+        if (self::$tablesReady) {
+            return;
+        }
+        $schema = Capsule::schema();
+
+        if (!$schema->hasTable(self::SESSIONS_TABLE)) {
+            $schema->create(self::SESSIONS_TABLE, function ($t) {
+                $t->increments('id');
+                $t->integer('invoice_id')->index();
+                $t->string('ref_trx', 80)->unique();
+                $t->string('invoice_currency', 10);
+                $t->decimal('invoice_amount', 16, 2);
+                $t->string('pay_currency', 10);
+                $t->decimal('pay_amount', 16, 2);
+                $t->decimal('rate', 20, 8);
+                $t->string('rate_mode', 10);
+                $t->string('trx_id', 100)->nullable()->index();
+                $t->integer('created_at');
+            });
+        }
+        if (!$schema->hasTable(self::RATES_TABLE)) {
+            $schema->create(self::RATES_TABLE, function ($t) {
+                $t->string('pair', 20)->primary();
+                $t->decimal('rate', 20, 8)->default(0);
+                $t->integer('fetched_at')->default(0); // for pair "_backoff": the time until which fetching is paused
+            });
+        }
+        self::$tablesReady = true;
+    }
+
+    /** Default WHMCS currency code (used for the Fixed rate). */
+    public static function defaultCurrency()
+    {
+        return strtoupper((string) Capsule::table('tblcurrencies')->where('default', 1)->value('code'));
+    }
+
+    /** Last known rate (fresh or stale) WITHOUT any network call - safe for the admin settings page. */
+    public static function cachedRate($base, $quote)
+    {
+        self::ensureTables();
+        $row = Capsule::table(self::RATES_TABLE)->where('pair', strtoupper($base . '/' . $quote))->first();
+        return ($row && (float) $row->rate > 0) ? (float) $row->rate : null;
+    }
+
+    /**
+     * Live rate: 1 {base} = X {quote}. Returns 0.0 when no usable rate exists - the caller must then
+     * refuse the payment instead of guessing.
+     */
+    public static function liveRate($base, $quote)
+    {
+        self::ensureTables();
+        $base = strtoupper($base);
+        $quote = strtoupper($quote);
+        $pair = $base . '/' . $quote;
+
+        $row = Capsule::table(self::RATES_TABLE)->where('pair', $pair)->first();
+        if ($row && (float) $row->rate > 0 && (time() - (int) $row->fetched_at) < self::RATE_TTL) {
+            return (float) $row->rate;
+        }
+
+        $backoff = Capsule::table(self::RATES_TABLE)->where('pair', '_backoff')->value('fetched_at');
+        if ((int) $backoff < time()) {
+            $res = self::fetchRate($base, $quote);
+            if ($res['rate'] > 0) {
+                Capsule::table(self::RATES_TABLE)->updateOrInsert(
+                    ['pair' => $pair],
+                    ['rate' => $res['rate'], 'fetched_at' => time()]
+                );
+                return $res['rate'];
+            }
+            Capsule::table(self::RATES_TABLE)->updateOrInsert(
+                ['pair' => '_backoff'],
+                ['rate' => 0, 'fetched_at' => time() + $res['backoff']]
+            );
+        }
+
+        // Provider unavailable or backing off: last known rate, but not an old one.
+        if ($row && (float) $row->rate > 0 && (time() - (int) $row->fetched_at) <= self::RATE_STALE_MAX) {
+            return (float) $row->rate;
+        }
+        return 0.0;
+    }
+
+    /** open.er-api.com: free, no key, attribution required, cache allowed, 429 = blocked for 20 min. */
+    private static function fetchRate($base, $quote)
+    {
+        $out = ['rate' => 0.0, 'backoff' => 300];
+        if (!function_exists('curl_init')) {
+            return $out;
+        }
+        $ch = curl_init();
+        curl_setopt_array($ch, [
+            CURLOPT_URL            => self::RATE_API . rawurlencode($base),
+            CURLOPT_RETURNTRANSFER => true,
+            CURLOPT_CONNECTTIMEOUT => 5,
+            CURLOPT_TIMEOUT        => 10,
+            CURLOPT_FOLLOWLOCATION => false,
+            CURLOPT_SSL_VERIFYPEER => true,
+            CURLOPT_SSL_VERIFYHOST => 2,
+            CURLOPT_HTTPHEADER     => ['Accept: application/json'],
+        ]);
+        $raw = curl_exec($ch);
+        $http = (int) curl_getinfo($ch, CURLINFO_HTTP_CODE);
+        curl_close($ch);
+
+        if ($http === 429) {
+            $out['backoff'] = 1260;
+            return $out;
+        }
+        $data = ($raw !== false) ? json_decode($raw, true) : null;
+        if ($http !== 200 || !is_array($data)
+            || ($data['result'] ?? '') !== 'success'
+            || strtoupper((string) ($data['base_code'] ?? '')) !== $base) {
+            return $out;
+        }
+        $rate = $data['rates'][$quote] ?? null;
+        if (is_numeric($rate) && (float) $rate > 0 && (float) $rate < 10000000) {
+            $out['rate'] = (float) $rate;
+        }
+        return $out;
+    }
+
+    /** Settings-page hint; reads saved settings and the cached rate only (no network). */
+    public static function rateHint()
+    {
+        $hint = 'Live rates are fetched automatically and cached for 1 hour. '
+            . '<a href="https://www.exchangerate-api.com" target="_blank" rel="noopener">Rates By Exchange Rate API</a>.';
+        try {
+            $wallet = strtoupper(trim((string) Capsule::table('tblpaymentgateways')
+                ->where('gateway', self::MODULE)->where('setting', 'walletCurrency')->value('value')));
+            $default = self::defaultCurrency();
+            if ($wallet !== '' && $default !== '' && $wallet !== $default) {
+                $known = self::cachedRate($wallet, $default);
+                $hint .= $known
+                    ? ' Last known rate: 1 ' . $wallet . ' = ' . rtrim(rtrim(number_format($known, 6, '.', ''), '0'), '.') . ' ' . $default . '.'
+                    : ' No rate has been fetched yet; it is fetched at the first payment.';
+            }
+        } catch (\Exception $e) {
+            // Never break the settings page over a hint.
+        }
+        return $hint;
+    }
+
+    /**
+     * Amount and currency actually sent to Ovajj for an invoice.
+     * Wallet currency empty or equal to the invoice currency => no conversion.
+     * Fixed rate applies to invoices in the default WHMCS currency; other currencies use the live rate.
+     *
+     * @return array{amount:float,currency:string,rate:float,mode:string,error:?string}
+     */
+    public static function paymentAmount(array $params, array $ctx)
+    {
+        $inv = $ctx['currency'];
+        $wallet = strtoupper(trim((string) ($params['walletCurrency'] ?? '')));
+
+        if ($wallet === '' || $wallet === $inv) {
+            return ['amount' => $ctx['balance'], 'currency' => $inv, 'rate' => 1.0, 'mode' => 'none', 'error' => null];
+        }
+
+        // Rate meaning: 1 {wallet currency} = {rate} {invoice currency}.
+        $useFixed = (($params['rateMode'] ?? 'live') === 'fixed') && $inv === self::defaultCurrency();
+        if ($useFixed) {
+            $mode = 'fixed';
+            $rate = (float) str_replace(',', '.', trim((string) ($params['fixedRate'] ?? '')));
+        } else {
+            $mode = 'live';
+            $rate = self::liveRate($wallet, $inv);
+        }
+        if ($rate <= 0) {
+            return ['amount' => 0.0, 'currency' => $wallet, 'rate' => 0.0, 'mode' => $mode,
+                'error' => 'No usable exchange rate for ' . $wallet . '/' . $inv . ' (' . $mode . ' mode)'];
+        }
+
+        return [
+            'amount'   => (float) number_format($ctx['balance'] / $rate, 2, '.', ''),
+            'currency' => $wallet,
+            'rate'     => $rate,
+            'mode'     => $mode,
+            'error'    => null,
+        ];
+    }
+
+    /* ------------ payment sessions (what each checkout asked Ovajj for) ------------ */
+
+    public static function saveSession(array $row)
+    {
+        self::ensureTables();
+        $row['created_at'] = time();
+        Capsule::table(self::SESSIONS_TABLE)->insert($row);
+    }
+
+    public static function hasSessions($invoiceId)
+    {
+        self::ensureTables();
+        return Capsule::table(self::SESSIONS_TABLE)->where('invoice_id', (int) $invoiceId)->exists();
+    }
+
+    /** The session a payment belongs to: by ref_trx, else any session of this invoice with the same amount/currency. */
+    public static function findSession($invoiceId, $refTrx, $currency, $payMinor)
+    {
+        self::ensureTables();
+        $q = Capsule::table(self::SESSIONS_TABLE)->where('invoice_id', (int) $invoiceId);
+
+        if ($refTrx !== '') {
+            $row = (clone $q)->where('ref_trx', $refTrx)->first();
+            if ($row) {
+                return (array) $row;
+            }
+        }
+        foreach ((clone $q)->orderBy('id', 'desc')->limit(20)->get() as $row) {
+            if (strtoupper($row->pay_currency) === strtoupper($currency) && self::minor($row->pay_amount) === (int) $payMinor) {
+                return (array) $row;
+            }
+        }
+        return null;
+    }
+
+    public static function markSessionPaid($sessionId, $trxId)
+    {
+        Capsule::table(self::SESSIONS_TABLE)->where('id', (int) $sessionId)->update(['trx_id' => $trxId]);
+    }
+
+    public static function sessionByTrx($trxId)
+    {
+        self::ensureTables();
+        $row = Capsule::table(self::SESSIONS_TABLE)->where('trx_id', $trxId)->first();
+        return $row ? (array) $row : null;
+    }
 }

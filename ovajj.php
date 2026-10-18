@@ -66,6 +66,36 @@ function ovajj_config()
             'Size'         => '40',
             'Description'  => 'Signs API requests and verifies webhooks. Never exposed to the browser.',
         ],
+        'walletCurrency' => [
+            'FriendlyName' => 'Wallet Currency',
+            'Type'         => 'dropdown',
+            'Options'      => [
+                ''    => 'Same as invoice currency (no conversion)',
+                'USD' => 'USD',
+                'EUR' => 'EUR',
+                'GBP' => 'GBP',
+                'BDT' => 'BDT',
+            ],
+            'Default'      => '',
+            'Description'  => 'Currency of your Ovajj wallet. If it differs from the invoice currency (e.g. invoices in BDT, wallet in USD), the amount is converted before payment. Invoices are still recorded in their own currency.',
+        ],
+        'rateMode' => [
+            'FriendlyName' => 'Exchange Rate',
+            'Type'         => 'dropdown',
+            'Options'      => [
+                'live'  => 'Live rate (free, automatic)',
+                'fixed' => 'Fixed rate',
+            ],
+            'Default'      => 'live',
+            'Description'  => Helper::rateHint(),
+        ],
+        'fixedRate' => [
+            'FriendlyName' => 'Fixed Rate',
+            'Type'         => 'text',
+            'Size'         => '15',
+            'Default'      => '',
+            'Description'  => 'Used only in Fixed mode, for invoices in your default WHMCS currency: how many default-currency units equal 1 wallet-currency unit (wallet USD, default BDT, rate <code>122.50</code> means 1 USD = 122.50 BDT). Invoices in other currencies always use the live rate.',
+        ],
         'debugLogging' => [
             'FriendlyName' => 'Debug Logging',
             'Type'         => 'yesno',
@@ -94,7 +124,11 @@ function ovajj_link($params)
         return '<div class="alert alert-warning">This payment method cannot process this invoice currency.</div>';
     }
 
-    if ((float) $params['amount'] < Helper::MIN_AMOUNT) {
+    $wallet = strtoupper(trim((string) ($params['walletCurrency'] ?? '')));
+    $converting = ($wallet !== '' && $wallet !== strtoupper((string) $params['currency']));
+
+    // With conversion the minimum is checked on the converted amount in pay.php.
+    if (!$converting && (float) $params['amount'] < Helper::MIN_AMOUNT) {
         return '<div class="alert alert-warning">The amount due is below the minimum accepted by this payment method.</div>';
     }
 
@@ -106,7 +140,10 @@ function ovajj_link($params)
         . $token
         . '<input type="hidden" name="invoiceid" value="' . $invoiceId . '">'
         . '<input type="submit" class="btn btn-primary" value="' . htmlspecialchars($label, ENT_QUOTES) . '">'
-        . '</form>';
+        . '</form>'
+        . ($converting
+            ? '<p class="small text-muted" style="margin-top:6px">This payment is charged in ' . htmlspecialchars($wallet, ENT_QUOTES) . ' at the current exchange rate.</p>'
+            : '');
 }
 
 /**
@@ -133,11 +170,26 @@ function ovajj_refund($params)
         return ['status' => 'error', 'rawdata' => 'Invalid refund amount.'];
     }
 
+    // If this payment was charged in the wallet currency, refund in that currency at the rate the
+    // customer actually paid. A full refund returns exactly what was charged.
+    $refundAmount = $amount;
+    $session = Helper::sessionByTrx($transId);
+    if ($session && strtoupper((string) $session['pay_currency']) !== strtoupper((string) $session['invoice_currency'])) {
+        $rate = (float) $session['rate'];
+        $paid = (float) $session['pay_amount'];
+        if ($rate <= 0 || $paid <= 0) {
+            return ['status' => 'error', 'rawdata' => 'Cannot convert the refund: the original conversion rate is missing.'];
+        }
+        $refundAmount = (Helper::minor($amount) === Helper::minor($session['invoice_amount']))
+            ? $paid
+            : min($paid, (float) number_format($amount / $rate, 2, '.', ''));
+    }
+
     $payload = [
         'trx_id'     => $transId,
-        'amount'     => (float) Helper::money($amount),
+        'amount'     => (float) Helper::money($refundAmount),
         'reason'     => 'Refund for WHMCS invoice #' . (int) $params['invoiceid'],
-        'ref_refund' => 'WHMCS-' . substr(hash('sha256', $transId . '|' . Helper::minor($amount) . '|' . gmdate('YmdH')), 0, 32),
+        'ref_refund' => 'WHMCS-' . substr(hash('sha256', $transId . '|' . Helper::minor($refundAmount) . '|' . gmdate('YmdH')), 0, 32),
     ];
 
     $res = Helper::apiRequest($creds, 'POST', '/api/v1/refund-payment', $payload);

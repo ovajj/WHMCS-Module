@@ -237,21 +237,51 @@ if (!in_array($ctx['status'], ['Unpaid', 'Payment Pending'], true)) {
     $finish(200, 'invoice_not_payable');
 }
 
-// Currency: webhook and verify must both equal the invoice currency. No conversion, ever.
-$vCurrency = strtoupper((string) ($v['currency'] ?? ''));
-if ($hookCurrency !== $ctx['currency'] || $vCurrency !== $ctx['currency']) {
+// Which checkout session does this payment belong to? Its amount/currency (possibly converted to the
+// wallet currency) were recorded when the session was created.
+Helper::ensureTables();
+$sess = Helper::findSession($invoiceId, $refTrx, $hookCurrency, $hookMinor);
+if ($sess === null && !Helper::hasSessions($invoiceId)) {
+    // Invoices paid through sessions created before conversion existed: the invoice itself is the expectation.
+    $sess = [
+        'id' => 0, 'invoice_currency' => $ctx['currency'], 'invoice_amount' => $ctx['balance'],
+        'pay_currency' => $ctx['currency'], 'pay_amount' => $ctx['balance'], 'rate' => 1.0,
+    ];
+}
+if ($sess === null) {
+    logTransaction($name, $logCtx + ['reason' => 'Payment does not match any checkout session created for this invoice'], 'Session Mismatch');
+    $finish(409, 'session_mismatch');
+}
+
+$expCurrency = strtoupper((string) $sess['pay_currency']);
+$converted = ($expCurrency !== $ctx['currency']);
+$rate = (float) $sess['rate'];
+
+// The invoice must be unchanged since the session was created (credit, late fee, partial payment ...).
+if (strtoupper((string) $sess['invoice_currency']) !== $ctx['currency']
+    || Helper::minor($sess['invoice_amount']) !== Helper::minor($ctx['balance'])) {
     logTransaction($name, $logCtx + [
-        'reason' => 'Currency mismatch (invoice ' . $ctx['currency'] . ', webhook ' . $hookCurrency . ', verify ' . $vCurrency . ')',
+        'reason'          => 'Invoice balance changed since the payment session was created',
+        'session_invoice' => Helper::money($sess['invoice_amount']) . ' ' . $sess['invoice_currency'],
+        'amount_due_now'  => Helper::money($ctx['balance']) . ' ' . $ctx['currency'],
+    ], 'Amount Mismatch');
+    $finish(409, 'amount_mismatch');
+}
+
+// Currency: webhook and verify must both equal the session currency.
+$vCurrency = strtoupper((string) ($v['currency'] ?? ''));
+if ($hookCurrency !== $expCurrency || $vCurrency !== $expCurrency) {
+    logTransaction($name, $logCtx + [
+        'reason' => 'Currency mismatch (expected ' . $expCurrency . ', webhook ' . $hookCurrency . ', verify ' . $vCurrency . ')',
     ], 'Currency Mismatch');
     $finish(409, 'currency_mismatch');
 }
 
-// Amount: webhook "data.amount" is the gross charge and must equal the amount due.
+// Amount: webhook "data.amount" is the gross charge and must equal the session amount.
 // verify "amount" may be reported net of Ovajj's fee (docs example: amount 237.5 + fee 12.5),
-// so accept either amount or amount+fee equal to the amount due, with a 1-cent
-// tolerance because Ovajj rounds the fee and the net amount separately
-// (e.g. 49.50 charged -> verify amount 49.01 + fee 0.50 = 49.51).
-$dueMinor = Helper::minor($ctx['balance']);
+// so accept either amount or amount+fee equal to it, with a 1-cent tolerance because Ovajj
+// rounds the fee and the net amount separately (e.g. 49.50 charged -> verify 49.01 + fee 0.50 = 49.51).
+$dueMinor = Helper::minor($sess['pay_amount']);
 $vAmount = isset($v['amount']) && is_numeric($v['amount']) ? (float) $v['amount'] : null;
 $vFee = isset($v['fee']) && is_numeric($v['fee']) && (float) $v['fee'] >= 0 ? (float) $v['fee'] : 0.0;
 
@@ -262,24 +292,34 @@ $verifyOk = $vAmount !== null
 
 if (!$hookOk || !$verifyOk) {
     logTransaction($name, $logCtx + [
-        'reason'     => 'Amount mismatch',
-        'amount_due' => Helper::money($ctx['balance']),
+        'reason'        => 'Amount mismatch',
+        'expected'      => Helper::money($sess['pay_amount']) . ' ' . $expCurrency,
         'verify_amount' => $vAmount,
         'verify_fee'    => $vFee,
     ], 'Amount Mismatch');
     $finish(409, 'amount_mismatch');
 }
 
-// Record the verified payment. Fee is the Ovajj processing fee reported by verify-payment.
+// Record the verified payment in the INVOICE currency. The Ovajj fee is reported in the wallet currency,
+// so convert it with the same rate when the payment was converted.
 $paymentAmount = Helper::money($ctx['balance']);
-$paymentFee = ($vFee > 0 && $vFee < $ctx['balance']) ? Helper::money($vFee) : 0;
+$feeInvoice = $converted && $rate > 0 ? $vFee * $rate : $vFee;
+$paymentFee = ($feeInvoice > 0 && $feeInvoice < $ctx['balance']) ? Helper::money($feeInvoice) : 0;
 
 addInvoicePayment($invoiceId, $trxId, $paymentAmount, $paymentFee, $gatewayModuleName);
+if (!empty($sess['id'])) {
+    Helper::markSessionPaid($sess['id'], $trxId);
+}
 
-logTransaction($name, $logCtx + [
+$result = [
     'result'   => 'Payment verified and recorded',
     'recorded' => $paymentAmount . ' ' . $ctx['currency'],
     'fee'      => $paymentFee,
-], 'Successful');
+];
+if ($converted) {
+    $result['charged'] = Helper::money($sess['pay_amount']) . ' ' . $expCurrency
+        . ' at 1 ' . $expCurrency . ' = ' . rtrim(rtrim(number_format($rate, 6, '.', ''), '0'), '.') . ' ' . $ctx['currency'];
+}
+logTransaction($name, $logCtx + $result, 'Successful');
 
 $finish(200, 'processed');
