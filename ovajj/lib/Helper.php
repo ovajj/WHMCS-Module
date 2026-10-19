@@ -22,6 +22,10 @@ class Helper
 {
     const BASE_URL = 'https://ovajj.com';
     const MODULE = 'ovajj';
+    const VERSION = '2.2.0';
+
+    /** Currency Ovajj is charged in unless the admin types another code (USD is the rail used in every Ovajj example). */
+    const DEFAULT_PROCESSING_CURRENCY = 'USD';
 
     /** Documented minimum payment_amount. */
     const MIN_AMOUNT = 1.00;
@@ -84,6 +88,38 @@ class Helper
             $value = '';
         }
         return function_exists('mb_substr') ? mb_substr($value, 0, $max) : substr($value, 0, $max);
+    }
+
+    /** The "Processing Currency" setting: any currency code typed by the admin, default USD. */
+    public static function processingCurrency(array $params)
+    {
+        $code = strtoupper(preg_replace('/[^A-Za-z]/', '', (string) ($params['processingCurrency'] ?? '')));
+        return $code !== '' ? substr($code, 0, 10) : self::DEFAULT_PROCESSING_CURRENCY;
+    }
+
+    /** Decimal places used for amounts in a currency (crypto majors need 8, everything else 2). */
+    public static function decimals($currency)
+    {
+        return in_array(strtoupper((string) $currency), ['BTC', 'ETH'], true) ? 8 : 2;
+    }
+
+    /** Amount formatted with the currency's precision. */
+    public static function fmt($amount, $currency)
+    {
+        return number_format((float) $amount, self::decimals($currency), '.', '');
+    }
+
+    /** Human-readable exchange rate (tiny crypto rates need more digits). */
+    public static function fmtRate($rate)
+    {
+        $rate = (float) $rate;
+        return rtrim(rtrim(number_format($rate, $rate < 1 ? 12 : 6, '.', ''), '0'), '.');
+    }
+
+    /** Integer smallest-units (cents, satoshi ...) for exact, currency-aware comparison. */
+    public static function units($amount, $currency)
+    {
+        return (int) round(((float) $amount) * pow(10, self::decimals($currency)));
     }
 
     /** Decimal string with 2 places. */
@@ -325,18 +361,20 @@ class Helper
     }
 
     /* ---------------------------------------------------------------- *
-     * Currency conversion (optional): wallet currency, live/fixed rate
+     * Currency conversion: every invoice currency -> the Processing Currency (default USD), live or fixed rate
      * ---------------------------------------------------------------- */
 
     const SESSIONS_TABLE = 'mod_ovajj_sessions';
     const RATES_TABLE    = 'mod_ovajj_rates';
-    const RATE_API       = 'https://open.er-api.com/v6/latest/';
+    const RATE_API       = 'https://open.er-api.com/v6/latest/';           // fiat: any country's currency
+    const CRYPTO_API     = 'https://api.coinbase.com/v2/prices/';          // BTC / ETH / USDT spot price in USD
+    const CRYPTO         = ['BTC', 'ETH', 'USDT'];
     const RATE_TTL       = 3600;    // fresh cache: 1 hour
     const RATE_STALE_MAX = 172800;  // last known rate usable for 48 h if the provider is unreachable
 
     private static $tablesReady = false;
 
-    /** Creates the module's own tables on first use (no WHMCS core tables are touched). */
+    /** Creates/upgrades the module's own tables on first use (no WHMCS core tables are touched). */
     public static function ensureTables()
     {
         if (self::$tablesReady) {
@@ -350,10 +388,10 @@ class Helper
                 $t->integer('invoice_id')->index();
                 $t->string('ref_trx', 80)->unique();
                 $t->string('invoice_currency', 10);
-                $t->decimal('invoice_amount', 16, 2);
+                $t->decimal('invoice_amount', 24, 8);
                 $t->string('pay_currency', 10);
-                $t->decimal('pay_amount', 16, 2);
-                $t->decimal('rate', 20, 8);
+                $t->decimal('pay_amount', 24, 8);
+                $t->decimal('rate', 36, 12);
                 $t->string('rate_mode', 10);
                 $t->string('trx_id', 100)->nullable()->index();
                 $t->integer('created_at');
@@ -361,10 +399,22 @@ class Helper
         }
         if (!$schema->hasTable(self::RATES_TABLE)) {
             $schema->create(self::RATES_TABLE, function ($t) {
-                $t->string('pair', 20)->primary();
-                $t->decimal('rate', 20, 8)->default(0);
-                $t->integer('fetched_at')->default(0); // for pair "_backoff": the time until which fetching is paused
+                $t->string('pair', 24)->primary();
+                $t->decimal('rate', 36, 12)->default(0);
+                $t->integer('fetched_at')->default(0); // for "_backoff_*" rows: time until which fetching is paused
             });
+        }
+
+        // v2.0.0 upgrade: v1.1 tables stored 2 decimals; crypto needs 8 for amounts and 12 for rates.
+        $schemaVersion = (int) Capsule::table(self::RATES_TABLE)->where('pair', '_schema')->value('fetched_at');
+        if ($schemaVersion < 3) {
+            try {
+                Capsule::statement('ALTER TABLE `' . self::SESSIONS_TABLE . '` MODIFY `invoice_amount` DECIMAL(24,8) NOT NULL, MODIFY `pay_amount` DECIMAL(24,8) NOT NULL, MODIFY `rate` DECIMAL(36,12) NOT NULL');
+                Capsule::statement('ALTER TABLE `' . self::RATES_TABLE . '` MODIFY `rate` DECIMAL(36,12) NOT NULL DEFAULT 0, MODIFY `pair` VARCHAR(24) NOT NULL');
+                Capsule::table(self::RATES_TABLE)->updateOrInsert(['pair' => '_schema'], ['rate' => 0, 'fetched_at' => 3]);
+            } catch (\Exception $e) {
+                // Will be retried on the next request; payments in 2-decimal currencies are unaffected.
+            }
         }
         self::$tablesReady = true;
     }
@@ -386,6 +436,9 @@ class Helper
     /**
      * Live rate: 1 {base} = X {quote}. Returns 0.0 when no usable rate exists - the caller must then
      * refuse the payment instead of guessing.
+     *
+     * base is the Processing Currency; quote is the invoice currency, which can be
+     * any fiat currency the rate provider knows.
      */
     public static function liveRate($base, $quote)
     {
@@ -399,20 +452,13 @@ class Helper
             return (float) $row->rate;
         }
 
-        $backoff = Capsule::table(self::RATES_TABLE)->where('pair', '_backoff')->value('fetched_at');
-        if ((int) $backoff < time()) {
-            $res = self::fetchRate($base, $quote);
-            if ($res['rate'] > 0) {
-                Capsule::table(self::RATES_TABLE)->updateOrInsert(
-                    ['pair' => $pair],
-                    ['rate' => $res['rate'], 'fetched_at' => time()]
-                );
-                return $res['rate'];
-            }
+        $rate = self::fetchRate($base, $quote);
+        if ($rate > 0) {
             Capsule::table(self::RATES_TABLE)->updateOrInsert(
-                ['pair' => '_backoff'],
-                ['rate' => 0, 'fetched_at' => time() + $res['backoff']]
+                ['pair' => $pair],
+                ['rate' => $rate, 'fetched_at' => time()]
             );
+            return $rate;
         }
 
         // Provider unavailable or backing off: last known rate, but not an old one.
@@ -422,16 +468,28 @@ class Helper
         return 0.0;
     }
 
-    /** open.er-api.com: free, no key, attribution required, cache allowed, 429 = blocked for 20 min. */
-    private static function fetchRate($base, $quote)
+    private static function backoffActive($key)
     {
-        $out = ['rate' => 0.0, 'backoff' => 300];
+        return (int) Capsule::table(self::RATES_TABLE)->where('pair', '_backoff_' . $key)->value('fetched_at') > time();
+    }
+
+    private static function setBackoff($key, $seconds)
+    {
+        Capsule::table(self::RATES_TABLE)->updateOrInsert(
+            ['pair' => '_backoff_' . $key],
+            ['rate' => 0, 'fetched_at' => time() + (int) $seconds]
+        );
+    }
+
+    /** Small JSON GET used by the rate providers. @return array{http:int,data:?array} */
+    private static function getJson($url)
+    {
         if (!function_exists('curl_init')) {
-            return $out;
+            return ['http' => 0, 'data' => null];
         }
         $ch = curl_init();
         curl_setopt_array($ch, [
-            CURLOPT_URL            => self::RATE_API . rawurlencode($base),
+            CURLOPT_URL            => $url,
             CURLOPT_RETURNTRANSFER => true,
             CURLOPT_CONNECTTIMEOUT => 5,
             CURLOPT_TIMEOUT        => 10,
@@ -443,38 +501,104 @@ class Helper
         $raw = curl_exec($ch);
         $http = (int) curl_getinfo($ch, CURLINFO_HTTP_CODE);
         curl_close($ch);
-
-        if ($http === 429) {
-            $out['backoff'] = 1260;
-            return $out;
-        }
-        $data = ($raw !== false) ? json_decode($raw, true) : null;
-        if ($http !== 200 || !is_array($data)
-            || ($data['result'] ?? '') !== 'success'
-            || strtoupper((string) ($data['base_code'] ?? '')) !== $base) {
-            return $out;
-        }
-        $rate = $data['rates'][$quote] ?? null;
-        if (is_numeric($rate) && (float) $rate > 0 && (float) $rate < 10000000) {
-            $out['rate'] = (float) $rate;
-        }
-        return $out;
+        return ['http' => $http, 'data' => ($raw !== false) ? json_decode($raw, true) : null];
     }
 
-    /** Settings-page hint; reads saved settings and the cached rate only (no network). */
+    /**
+     * 1 {base} = X {quote} for any combination of fiat currencies and BTC / ETH / USDT.
+     * Fiat-to-fiat uses the fiat provider directly; anything involving crypto is resolved through USD.
+     */
+    private static function fetchRate($base, $quote)
+    {
+        $baseCrypto = in_array($base, self::CRYPTO, true);
+        $quoteCrypto = in_array($quote, self::CRYPTO, true);
+
+        if (!$baseCrypto && !$quoteCrypto) {
+            return self::fetchFiat($base, $quote);
+        }
+
+        $uBase = self::usdPerUnit($base);
+        if ($uBase <= 0) {
+            return 0.0;
+        }
+        $uQuote = self::usdPerUnit($quote);
+        return $uQuote > 0 ? $uBase / $uQuote : 0.0;
+    }
+
+    /** Value of one unit of a currency in USD (0.0 when unknown). */
+    private static function usdPerUnit($currency)
+    {
+        if ($currency === 'USD') {
+            return 1.0;
+        }
+        if (in_array($currency, self::CRYPTO, true)) {
+            return self::fetchCryptoUsd($currency);
+        }
+        $fx = self::fetchFiat('USD', $currency); // 1 USD = $fx {currency}
+        return $fx > 0 ? 1.0 / $fx : 0.0;
+    }
+
+    /** open.er-api.com: free, no key, any country's currency, attribution required, 429 = blocked 20 min. */
+    private static function fetchFiat($base, $quote)
+    {
+        if (self::backoffActive('fx')) {
+            return 0.0;
+        }
+        $res = self::getJson(self::RATE_API . rawurlencode($base));
+        if ($res['http'] === 429) {
+            self::setBackoff('fx', 1260);
+            return 0.0;
+        }
+        $d = $res['data'];
+        if ($res['http'] !== 200 || !is_array($d)
+            || ($d['result'] ?? '') !== 'success'
+            || strtoupper((string) ($d['base_code'] ?? '')) !== $base) {
+            self::setBackoff('fx', 300);
+            return 0.0;
+        }
+        $rate = $d['rates'][$quote] ?? null;
+        if (!is_numeric($rate) || (float) $rate <= 0 || (float) $rate > 1.0E+15) {
+            // The provider does not list this currency: no rate, no payment (never guess).
+            return 0.0;
+        }
+        return (float) $rate;
+    }
+
+    /** Coinbase public spot price (no key): price of 1 {BTC|ETH|USDT} in USD. */
+    private static function fetchCryptoUsd($symbol)
+    {
+        if (self::backoffActive('cb')) {
+            return 0.0;
+        }
+        $res = self::getJson(self::CRYPTO_API . rawurlencode($symbol) . '-USD/spot');
+        $amount = (is_array($res['data']) && isset($res['data']['data']['amount'])) ? $res['data']['data']['amount'] : null;
+        if ($res['http'] !== 200 || !is_numeric($amount) || (float) $amount <= 0 || (float) $amount > 1.0E+12) {
+            self::setBackoff('cb', 300);
+            return 0.0;
+        }
+        return (float) $amount;
+    }
+
+    /** Settings-page hint with both rate sources and their live feeds; reads the cache only (no network). */
     public static function rateHint()
     {
-        $hint = 'Live rates are fetched automatically and cached for 1 hour. '
-            . '<a href="https://www.exchangerate-api.com" target="_blank" rel="noopener">Rates By Exchange Rate API</a>.';
+        $hint = 'Live rates are cached for 1 hour.<br>'
+            . '<strong>USD, EUR, GBP and all other fiat currencies:</strong> '
+            . '<a href="https://www.exchangerate-api.com" target="_blank" rel="noopener">Rates By Exchange Rate API</a> '
+            . '(live feed: <a href="https://open.er-api.com/v6/latest/USD" target="_blank" rel="noopener">open.er-api.com/v6/latest/USD</a>)<br>'
+            . '<strong>BTC, ETH and USDT:</strong> '
+            . '<a href="https://www.coinbase.com/price" target="_blank" rel="noopener">Coinbase</a> '
+            . '(live feed: <a href="https://api.coinbase.com/v2/prices/BTC-USD/spot" target="_blank" rel="noopener">api.coinbase.com/v2/prices/BTC-USD/spot</a>)';
         try {
-            $wallet = strtoupper(trim((string) Capsule::table('tblpaymentgateways')
-                ->where('gateway', self::MODULE)->where('setting', 'walletCurrency')->value('value')));
+            $saved = (string) Capsule::table('tblpaymentgateways')
+                ->where('gateway', self::MODULE)->where('setting', 'processingCurrency')->value('value');
+            $wallet = self::processingCurrency(['processingCurrency' => $saved]);
             $default = self::defaultCurrency();
             if ($wallet !== '' && $default !== '' && $wallet !== $default) {
                 $known = self::cachedRate($wallet, $default);
-                $hint .= $known
-                    ? ' Last known rate: 1 ' . $wallet . ' = ' . rtrim(rtrim(number_format($known, 6, '.', ''), '0'), '.') . ' ' . $default . '.'
-                    : ' No rate has been fetched yet; it is fetched at the first payment.';
+                $hint .= '<br>' . ($known
+                    ? 'Last known rate: 1 ' . $wallet . ' = ' . self::fmtRate($known) . ' ' . $default . '.'
+                    : 'No rate has been fetched yet; it is fetched at the first payment.');
             }
         } catch (\Exception $e) {
             // Never break the settings page over a hint.
@@ -484,7 +608,7 @@ class Helper
 
     /**
      * Amount and currency actually sent to Ovajj for an invoice.
-     * Wallet currency empty or equal to the invoice currency => no conversion.
+     * Invoices already in the Processing Currency are not converted; every other currency is converted to it.
      * Fixed rate applies to invoices in the default WHMCS currency; other currencies use the live rate.
      *
      * @return array{amount:float,currency:string,rate:float,mode:string,error:?string}
@@ -492,9 +616,9 @@ class Helper
     public static function paymentAmount(array $params, array $ctx)
     {
         $inv = $ctx['currency'];
-        $wallet = strtoupper(trim((string) ($params['walletCurrency'] ?? '')));
+        $wallet = self::processingCurrency($params);
 
-        if ($wallet === '' || $wallet === $inv) {
+        if ($wallet === $inv) {
             return ['amount' => $ctx['balance'], 'currency' => $inv, 'rate' => 1.0, 'mode' => 'none', 'error' => null];
         }
 
@@ -513,7 +637,7 @@ class Helper
         }
 
         return [
-            'amount'   => (float) number_format($ctx['balance'] / $rate, 2, '.', ''),
+            'amount'   => (float) number_format($ctx['balance'] / $rate, self::decimals($wallet), '.', ''),
             'currency' => $wallet,
             'rate'     => $rate,
             'mode'     => $mode,
@@ -537,7 +661,7 @@ class Helper
     }
 
     /** The session a payment belongs to: by ref_trx, else any session of this invoice with the same amount/currency. */
-    public static function findSession($invoiceId, $refTrx, $currency, $payMinor)
+    public static function findSession($invoiceId, $refTrx, $currency, $payUnits)
     {
         self::ensureTables();
         $q = Capsule::table(self::SESSIONS_TABLE)->where('invoice_id', (int) $invoiceId);
@@ -549,7 +673,7 @@ class Helper
             }
         }
         foreach ((clone $q)->orderBy('id', 'desc')->limit(20)->get() as $row) {
-            if (strtoupper($row->pay_currency) === strtoupper($currency) && self::minor($row->pay_amount) === (int) $payMinor) {
+            if (strtoupper($row->pay_currency) === strtoupper($currency) && self::units($row->pay_amount, $row->pay_currency) === (int) $payUnits) {
                 return (array) $row;
             }
         }

@@ -86,7 +86,7 @@ if ($creds['environment'] === 'production' && strpos($systemUrl, 'https://') !==
     ovajj_pay_fail($invoiceId, $systemUrl);
 }
 
-// --- Amount/currency sent to Ovajj (converted to the wallet currency when configured) ---
+// --- Amount/currency sent to Ovajj (always USD; converted from the invoice currency when needed) ---
 $pay = Helper::paymentAmount($gatewayParams, $ctx);
 if ($pay['error'] !== null) {
     logTransaction($name, ['reason' => $pay['error'], 'invoice' => $invoiceId], 'Initiation Failed');
@@ -96,7 +96,7 @@ if ($pay['amount'] < Helper::MIN_AMOUNT) {
     logTransaction($name, [
         'reason'  => 'Payment amount is below the Ovajj minimum of 1.00 ' . $pay['currency'],
         'invoice' => $invoiceId,
-        'amount'  => Helper::money($pay['amount']),
+        'amount'  => Helper::fmt($pay['amount'], $pay['currency']),
     ], 'Failure');
     ovajj_pay_fail($invoiceId, $systemUrl);
 }
@@ -110,7 +110,7 @@ $ref = Helper::makeRef($invoiceId, $creds);
 $ipnToken = Helper::ipnToken($invoiceId, $creds);
 
 $payload = [
-    'payment_amount'   => (float) Helper::money($pay['amount']),
+    'payment_amount'   => (float) Helper::fmt($pay['amount'], $pay['currency']),
     'currency_code'    => $pay['currency'],
     'ref_trx'          => $ref,
     'description'      => $description,
@@ -137,11 +137,11 @@ $logBase = [
     'invoice'     => $invoiceId,
     'ref_trx'     => $ref,
     'environment' => $creds['environment'],
-    'amount'      => Helper::money($pay['amount']),
+    'amount'      => Helper::fmt($pay['amount'], $pay['currency']),
     'currency'    => $pay['currency'],
 ];
 if ($pay['mode'] !== 'none') {
-    $logBase['converted_from'] = Helper::money($ctx['balance']) . ' ' . $ctx['currency'] . ' at 1 ' . $pay['currency'] . ' = ' . rtrim(rtrim(number_format($pay['rate'], 6, '.', ''), '0'), '.') . ' ' . $ctx['currency'] . ' (' . $pay['mode'] . ')';
+    $logBase['converted_from'] = Helper::money($ctx['balance']) . ' ' . $ctx['currency'] . ' at 1 ' . $pay['currency'] . ' = ' . Helper::fmtRate($pay['rate']) . ' ' . $ctx['currency'] . ' (' . $pay['mode'] . ')';
 }
 
 if (!$res['ok']) {
@@ -156,7 +156,7 @@ $parts = $paymentUrl !== '' ? parse_url($paymentUrl) : false;
 // The response echoes what we asked for in "info"; make sure it matches before redirecting.
 $info = isset($data['info']) && is_array($data['info']) ? $data['info'] : [];
 $echoOk = (!isset($info['ref_trx']) || $info['ref_trx'] === $ref)
-    && (!isset($info['amount']) || Helper::minor($info['amount']) === Helper::minor($pay['amount']))
+    && (!isset($info['amount']) || Helper::units($info['amount'], $pay['currency']) === Helper::units($pay['amount'], $pay['currency']))
     && (!isset($info['currency_code']) || strtoupper((string) $info['currency_code']) === $pay['currency'])
     && (!isset($info['environment']) || $info['environment'] === $creds['environment']);
 
@@ -172,7 +172,7 @@ Helper::saveSession([
     'invoice_currency' => $ctx['currency'],
     'invoice_amount'   => Helper::money($ctx['balance']),
     'pay_currency'     => $pay['currency'],
-    'pay_amount'       => Helper::money($pay['amount']),
+    'pay_amount'       => Helper::fmt($pay['amount'], $pay['currency']),
     'rate'             => $pay['rate'],
     'rate_mode'        => $pay['mode'],
 ]);

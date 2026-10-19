@@ -14,7 +14,7 @@
             "Independent payment verification before an invoice is paid",
             "Duplicate-payment protection and amount/currency checks",
             "Sandbox and live environments",
-            "Optional currency conversion to your wallet currency (live or fixed rate)",
+            "Automatic currency conversion to your Processing Currency (live or fixed rate)",
             "Refunds from the WHMCS admin"
         ]
     },
